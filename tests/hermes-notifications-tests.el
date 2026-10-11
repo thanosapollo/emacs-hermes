@@ -67,19 +67,55 @@
       (should-not (hermes-notifications-notify 'chat-reply "Title" "Body"))
       (should-not called))))
 
-(ert-deftest hermes-notifications-suppress-visible-buffer-on-focused-frame ()
-  "A visible target on the focused frame needs no desktop interruption."
+(ert-deftest hermes-notifications-suppress-selected-buffer-on-focused-frame ()
+  "A target in the selected window of the focused frame is not interrupted."
   (with-temp-buffer
-    (let (called)
-      (cl-letf (((symbol-function 'frame-focus-state) (lambda (&rest _) t))
-                ((symbol-function 'get-buffer-window)
-                 (lambda (&rest _) (selected-window)))
-                ((symbol-function 'notifications-notify)
-                 (lambda (&rest _) (setq called t))))
-        (should-not
-         (hermes-notifications-notify
-          'chat-reply "Title" "Body" :buffer (current-buffer)))
-        (should-not called)))))
+    (save-window-excursion
+      (set-window-buffer (selected-window) (current-buffer))
+      (let (called)
+        (cl-letf (((symbol-function 'frame-focus-state) (lambda (&rest _) t))
+                  ((symbol-function 'notifications-notify)
+                   (lambda (&rest _) (setq called t))))
+          (should-not
+           (hermes-notifications-notify
+            'chat-reply "Title" "Body" :buffer (current-buffer)))
+          (should-not called))))))
+
+(ert-deftest hermes-notifications-notify-buffer-in-unselected-window ()
+  "A target merely visible beside the selected window is not attended.
+Side windows, and EXWM sessions whose focused frame selects an X window
+buffer, still leave the chat unattended."
+  (with-temp-buffer
+    (save-window-excursion
+      (delete-other-windows)
+      (set-window-buffer (split-window) (current-buffer))
+      (should (get-buffer-window (current-buffer)))
+      (should-not (eq (window-buffer (selected-window)) (current-buffer)))
+      (let (called)
+        (cl-letf (((symbol-function 'frame-focus-state) (lambda (&rest _) t))
+                  ((symbol-function 'require) (lambda (&rest _) t))
+                  ((symbol-function 'notifications-notify)
+                   (lambda (&rest _) (setq called t) 5)))
+          (should (= 5 (hermes-notifications-notify
+                        'prompt "Title" "Body" :buffer (current-buffer))))
+          (should called))))))
+
+(ert-deftest hermes-notifications-suppress-minibuffer-for-selected-buffer ()
+  "Reading input from the target's window keeps the target attended."
+  (with-temp-buffer
+    (save-window-excursion
+      (delete-other-windows)
+      (let ((window (split-window)) called)
+        (set-window-buffer window (current-buffer))
+        (cl-letf (((symbol-function 'frame-focus-state) (lambda (&rest _) t))
+                  ((symbol-function 'minibuffer-selected-window)
+                   (lambda () window))
+                  ((symbol-function 'notifications-notify)
+                   (lambda (&rest _) (setq called t))))
+          (should-not
+           (hermes-notifications-notify
+            'prompt "Title" "Body" :buffer (current-buffer)))
+          (should-not called))))))
 
 (ert-deftest hermes-notifications-action-opens-live-buffer ()
   "The default action opens the target buffer when it remains live."

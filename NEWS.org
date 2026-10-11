@@ -1,5 +1,14 @@
 #+title: emacs-hermes Changelog
 
+* Unreleased
+
+- Pending chat prompts appear in the global mode line, for example
+  =[Hermes: Clarify]=, until they are answered, expire or are cleared.
+  Clicking the segment answers from the owning chat; set
+  =hermes-chat-prompt-indicator= to =nil= to hide it.  Prompt, reply and
+  error notifications are now suppressed only while the chat is in the
+  selected window of the focused frame, not when it is merely visible.
+
 * Version 0.8.0 (2026-10-01)
 
 - Negotiated server-to-client JSON-RPC requests for approvals, clarifications,

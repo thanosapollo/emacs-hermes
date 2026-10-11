@@ -1741,6 +1741,7 @@ forgets both the live and durable session ids so the next send starts fresh."
     (hermes-chat--invalidate-transport-state)
     (hermes-chat--stop-dashboard-client)
     (hermes-chat--setup-buffer)
+    (hermes-chat--prompt-indicator-sync)
     (hermes-chat-draft--activate)
     (hermes-chat--restore-draft-runtime)
     (when outermost

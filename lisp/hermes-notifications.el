@@ -66,10 +66,16 @@ WIDTH defaults to 160 columns."
    (or width 160) nil nil "…"))
 
 (defun hermes-notifications--buffer-attended-p (buffer)
-  "Return whether BUFFER is visible on the focused selected frame."
+  "Return whether BUFFER is in the selected window of the focused frame.
+A buffer merely visible in another window, such as a side window, is not
+attended.  Neither is any buffer while the selected window shows something
+else, which also covers window managers like EXWM that keep the Emacs frame
+focused while an X application has the user's attention.  While the
+minibuffer is active, the window it was entered from counts as selected."
   (and (buffer-live-p buffer)
        (frame-focus-state)
-       (get-buffer-window buffer (selected-frame))))
+       (eq (window-buffer (or (minibuffer-selected-window) (selected-window)))
+           buffer)))
 
 (defun hermes-notifications--remove-action-callback (callback)
   "Remove CALLBACK from pending desktop notification actions."
@@ -87,7 +93,7 @@ WIDTH defaults to 160 columns."
 (cl-defun hermes-notifications-notify
     (event title body &key buffer open urgency category)
   "Notify for EVENT with TITLE and BODY.
-Skip disabled events and a BUFFER already visible on the focused frame.  A
+Skip disabled events and a BUFFER already selected on the focused frame.  A
 click calls OPEN when supplied, otherwise it displays BUFFER.  URGENCY and
 CATEGORY are passed to `notifications-notify'.  Nil EVENT bypasses the event
 policy for compatibility callers."

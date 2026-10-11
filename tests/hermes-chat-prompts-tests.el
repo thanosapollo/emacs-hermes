@@ -3292,5 +3292,274 @@ stays available."
           (should-not (hermes-chat--pending-prompt-p))
           (should-not frames))))))
 
+;; Global pending-prompt indicator
+
+(defmacro hermes-test-with-prompt-indicator (&rest body)
+  "Run BODY with an enabled, empty, isolated pending-prompt indicator."
+  (declare (indent 0) (debug t))
+  `(let ((hermes-chat-prompt-indicator t)
+         (hermes-chat--prompt-indicator-buffers nil)
+         (global-mode-string nil))
+     ,@body))
+
+(defun hermes-test--prompt-indicator-text ()
+  "Return the plain pending-prompt indicator text, or nil."
+  (when-let* ((text (hermes-chat--prompt-indicator-string)))
+    (substring-no-properties text)))
+
+(ert-deftest hermes-chat-prompt-indicator-tracks-clarify-until-answered ()
+  "A clarification is named globally, without its contents, until answered."
+  (hermes-test-with-prompt-indicator
+    (cl-letf (((symbol-function 'hermes-dashboard-transport-clarify-respond)
+               (lambda (_client _id _answer &optional resolve _reject)
+                 (funcall resolve '((status . "ok"))))))
+      (hermes-test-with-dashboard-prompt-session (client)
+        (should-not (hermes-chat--prompt-indicator-string))
+        (should-not global-mode-string)
+        (hermes-test--emit-dashboard-prompt
+         client "clarify.request"
+         '((request_id . "req-clarify") (question . "Private question?")))
+        (should (equal hermes-chat--prompt-indicator-buffers
+                       (list (current-buffer))))
+        (should (equal global-mode-string
+                       '("" hermes-chat-prompt-indicator-mode-line)))
+        (let ((text (hermes-chat--prompt-indicator-string)))
+          (should (equal (substring-no-properties text) " [Hermes: Clarify]"))
+          (should (string-match-p (regexp-quote (buffer-name))
+                                  (get-text-property 1 'help-echo text)))
+          (should-not (string-match-p "Private"
+                                      (get-text-property 1 'help-echo text)))
+          (should (eq (lookup-key (get-text-property 1 'local-map text)
+                                  [mode-line mouse-1])
+                      #'hermes-chat-prompt-indicator-respond)))
+        (hermes-chat-respond-to-prompt "req-clarify" "yes")
+        (should-not hermes-chat--prompt-indicator-buffers)
+        (should-not (hermes-chat--prompt-indicator-string))))))
+
+(ert-deftest hermes-chat-prompt-indicator-clears-on-expiry-reset-and-kill ()
+  "Expiry, session clearing and killing the chat each retire the indicator."
+  (hermes-test-with-prompt-indicator
+    (hermes-test-with-dashboard-prompt-session (client)
+      (let ((chat (current-buffer)))
+        (hermes-test--emit-dashboard-prompt
+         client "clarify.request" '((request_id . "expiring") (question . "Q")))
+        (should (memq chat hermes-chat--prompt-indicator-buffers))
+        (hermes-test--emit-dashboard-prompt
+         client "clarify.expire" '((request_id . "expiring")))
+        (should-not hermes-chat--prompt-indicator-buffers)
+        (should-not (hermes-chat--prompt-indicator-string))
+        (hermes-test--emit-dashboard-prompt
+         client "clarify.request" '((request_id . "reset") (question . "Q")))
+        (should (hermes-chat--prompt-indicator-string))
+        (hermes-chat--clear-pending-prompts)
+        (should-not hermes-chat--prompt-indicator-buffers)
+        (should-not (hermes-chat--prompt-indicator-string))
+        (hermes-test--emit-dashboard-prompt
+         client "clarify.request" '((request_id . "killed") (question . "Q")))
+        (should (memq chat hermes-chat--prompt-indicator-buffers))
+        (let ((kill-buffer-query-functions nil))
+          (kill-buffer chat))
+        (should-not hermes-chat--prompt-indicator-buffers)
+        (should-not (hermes-chat--prompt-indicator-string))))))
+
+(ert-deftest hermes-chat-prompt-indicator-counts-and-honours-option ()
+  "Several prompts show a count; a disabled option hides but keeps tracking."
+  (hermes-test-with-prompt-indicator
+    (hermes-test-with-dashboard-prompt-session (client)
+      (dolist (id '("first" "second"))
+        (hermes-test--emit-dashboard-prompt
+         client "clarify.request" `((request_id . ,id) (question . "Q"))))
+      (should (equal (hermes-test--prompt-indicator-text)
+                     " [Hermes: Clarify +1]"))
+      (let ((hermes-chat-prompt-indicator nil))
+        (should-not (hermes-chat--prompt-indicator-string)))
+      (hermes-chat--clear-pending-prompts)
+      (let ((hermes-chat-prompt-indicator nil)
+            (global-mode-string nil))
+        (hermes-test--emit-dashboard-prompt
+         client "clarify.request" '((request_id . "quiet") (question . "Q")))
+        (should (equal hermes-chat--prompt-indicator-buffers
+                       (list (current-buffer))))
+        (should-not (hermes-chat--prompt-indicator-string))
+        (should-not global-mode-string)))))
+
+(ert-deftest hermes-chat-prompt-indicator-enabling-shows-earlier-prompts ()
+  "Enabling the option shows prompts that arrived in any chat while it was off."
+  (hermes-test-with-prompt-indicator
+    (let ((set (get 'hermes-chat-prompt-indicator 'custom-set)))
+      (funcall set 'hermes-chat-prompt-indicator nil)
+      (hermes-test-with-dashboard-prompt-session (first)
+        (let ((first-chat (current-buffer)))
+          (hermes-test--emit-dashboard-prompt
+           first "clarify.request" '((request_id . "one") (question . "Q")))
+          (hermes-test-with-dashboard-prompt-session (second)
+            (hermes-test--emit-dashboard-prompt
+             second "clarify.request" '((request_id . "two") (question . "Q")))
+            (should-not global-mode-string)
+            (should-not (hermes-chat--prompt-indicator-string))
+            (funcall set 'hermes-chat-prompt-indicator t)
+            (should (memq 'hermes-chat-prompt-indicator-mode-line
+                          global-mode-string))
+            (should (equal hermes-chat--prompt-indicator-buffers
+                           (list first-chat (current-buffer))))
+            (should (equal (hermes-test--prompt-indicator-text)
+                           " [Hermes: Clarify +1]"))))))))
+
+(ert-deftest hermes-chat-prompt-indicator-retires-on-reset-and-mode-change ()
+  "Resetting the transcript or re-running the major mode retires the chat."
+  (hermes-test-with-prompt-indicator
+    (hermes-test-with-dashboard-prompt-session (client)
+      (hermes-test--emit-dashboard-prompt
+       client "clarify.request" '((request_id . "reset") (question . "Q")))
+      (should (equal hermes-chat--prompt-indicator-buffers
+                     (list (current-buffer))))
+      (hermes-chat--reset-transcript)
+      (should-not (hermes-chat--pending-prompt-p))
+      (should-not hermes-chat--prompt-indicator-buffers)))
+  (hermes-test-with-prompt-indicator
+    (hermes-test-with-dashboard-prompt-session (client)
+      (hermes-test--emit-dashboard-prompt
+       client "clarify.request" '((request_id . "mode") (question . "Q")))
+      (should hermes-chat--prompt-indicator-buffers)
+      (hermes-chat-mode)
+      (should-not (hermes-chat--pending-prompt-p))
+      (should-not hermes-chat--prompt-indicator-buffers))))
+
+;; `format-mode-line' returns "" in batch Emacs, so these tests check the
+;; structure the mode line would render and walk it for reference cycles.
+(defun hermes-test--mode-line-cyclic-p (construct &optional path)
+  "Return non-nil if rendering CONSTRUCT would follow a symbol cycle.
+PATH lists the symbols already being rendered around CONSTRUCT."
+  (cond
+   ((and (symbolp construct) construct (not (eq construct t))
+         (not (keywordp construct)) (boundp construct))
+    (or (memq construct path)
+        (hermes-test--mode-line-cyclic-p (symbol-value construct)
+                                         (cons construct path))))
+   ((eq (car-safe construct) :eval) nil)
+   ((eq (car-safe construct) :propertize)
+    (hermes-test--mode-line-cyclic-p (cadr construct) path))
+   ((consp construct)
+    (let ((tail construct) cyclic)
+      (while (and (consp tail) (not cyclic))
+        (setq cyclic (hermes-test--mode-line-cyclic-p (car tail) path)
+              tail (cdr tail)))
+      cyclic))))
+
+(defun hermes-test--prompt-indicator-toggle (state)
+  "Set `hermes-chat-prompt-indicator' to STATE through Customize."
+  (funcall (get 'hermes-chat-prompt-indicator 'custom-set)
+           'hermes-chat-prompt-indicator state))
+
+(ert-deftest hermes-chat-prompt-indicator-preserves-mode-string-semantics ()
+  "Installing keeps foreign values' rendering; disabling restores them exactly."
+  (hermes-test-with-prompt-indicator
+    (let ((segment 'hermes-chat-prompt-indicator-mode-line))
+      (hermes-test--prompt-indicator-toggle t)
+      (hermes-test--prompt-indicator-toggle t)
+      (should (equal global-mode-string (list "" segment)))
+      (hermes-test--prompt-indicator-toggle nil)
+      (should-not hermes-chat-prompt-indicator)
+      (should-not global-mode-string)
+      ;; A string reached through a symbol renders literally; inside a list
+      ;; it is %-processed, so "%b" would turn into the buffer name.  Special
+      ;; list constructs must not be extended either, so all of these are
+      ;; wrapped whole in a fresh symbol.
+      (dolist (value (list "%b" "100%%" 'display-time-string
+                           '(:eval (ignore)) '(:propertize "x" face bold)
+                           '(display-time-string "on" "off") '(10 "%b")))
+        (setq global-mode-string value)
+        (hermes-test--prompt-indicator-toggle t)
+        (hermes-test--prompt-indicator-toggle t)
+        (pcase-let ((`("" ,saved ,(pred (eq segment))) global-mode-string))
+          (should (symbolp saved))
+          (should-not (eq saved (intern-soft (symbol-name saved))))
+          (should (get saved 'risky-local-variable))
+          (should (eq (symbol-value saved) value)))
+        (should-not (hermes-test--mode-line-cyclic-p 'global-mode-string))
+        (hermes-test--prompt-indicator-toggle nil)
+        (should (eq global-mode-string value)))
+      ;; Concatenation lists get the segment appended and lose only it.
+      (dolist (value (list '("" display-time-string) '("%b " "x")
+                           '((:eval (ignore)) display-time-string)))
+        (setq global-mode-string (copy-sequence value))
+        (hermes-test--prompt-indicator-toggle t)
+        (hermes-test--prompt-indicator-toggle t)
+        (should (equal global-mode-string (append value (list segment))))
+        (hermes-test--prompt-indicator-toggle nil)
+        (should (equal global-mode-string value))))))
+
+(ert-deftest hermes-chat-prompt-indicator-toggling-never-self-references ()
+  "Foreign edits between toggles never make `global-mode-string' cyclic."
+  (hermes-test-with-prompt-indicator
+    (let ((segment 'hermes-chat-prompt-indicator-mode-line))
+      (setq global-mode-string "%b")
+      (hermes-test--prompt-indicator-toggle t)
+      (setq global-mode-string (append global-mode-string '(" OTHER")))
+      (hermes-test--prompt-indicator-toggle nil)
+      (should-not (memq segment global-mode-string))
+      (should (member " OTHER" global-mode-string))
+      (setq global-mode-string (cons "PREFIX " global-mode-string))
+      (hermes-test--prompt-indicator-toggle t)
+      (should (memq segment global-mode-string))
+      (should-not (hermes-test--mode-line-cyclic-p 'global-mode-string))
+      (hermes-test--prompt-indicator-toggle nil)
+      (hermes-test--prompt-indicator-toggle t)
+      (should-not (hermes-test--mode-line-cyclic-p 'global-mode-string))
+      (hermes-test--prompt-indicator-toggle nil)
+      (should-not (memq segment global-mode-string))
+      (pcase-let ((`("PREFIX " "" ,saved " OTHER") global-mode-string))
+        (should (equal (symbol-value saved) "%b"))))))
+
+(ert-deftest hermes-chat-prompt-indicator-uninstalls-after-foreign-edits ()
+  "Disabling removes the segment even after the list was edited elsewhere."
+  (hermes-test-with-prompt-indicator
+    (let ((segment 'hermes-chat-prompt-indicator-mode-line))
+      (setq global-mode-string (list "" 'display-time-string))
+      (hermes-test--prompt-indicator-toggle t)
+      (setq global-mode-string (cons "PREFIX " global-mode-string))
+      (hermes-test--prompt-indicator-toggle nil)
+      (should (equal global-mode-string
+                     '("PREFIX " "" display-time-string)))
+      (setq global-mode-string nil)
+      (hermes-test--prompt-indicator-toggle t)
+      (setq global-mode-string (append global-mode-string '(other)))
+      (hermes-test--prompt-indicator-toggle nil)
+      (should (equal global-mode-string '("" other)))
+      (setq global-mode-string "%b")
+      (hermes-test--prompt-indicator-toggle t)
+      (setq global-mode-string (cons "PREFIX " global-mode-string))
+      (hermes-test--prompt-indicator-toggle nil)
+      (should-not (memq segment global-mode-string))
+      (should (equal (car global-mode-string) "PREFIX "))
+      ;; A segment inside a foreign conditional construct is not ours.
+      (let ((conditional (list 'display-time-string segment)))
+        (setq global-mode-string conditional)
+        (hermes-test--prompt-indicator-toggle nil)
+        (should (eq global-mode-string conditional))
+        (hermes-test--prompt-indicator-toggle t)
+        (hermes-test--prompt-indicator-toggle nil)
+        (should (eq global-mode-string conditional))
+        (should (equal conditional (list 'display-time-string segment)))))))
+
+(ert-deftest hermes-chat-prompt-indicator-click-answers-in-owning-chat ()
+  "Clicking the segment answers from the chat that owns the prompt."
+  (hermes-test-with-prompt-indicator
+    (hermes-test-with-dashboard-prompt-session (client)
+      (let ((chat (current-buffer)) called-in)
+        (hermes-test--emit-dashboard-prompt
+         client "clarify.request" '((request_id . "req") (question . "Q")))
+        (cl-letf (((symbol-function 'hermes-chat-respond-to-prompt)
+                   (lambda (&rest _)
+                     (interactive)
+                     (setq called-in (current-buffer)))))
+          (with-temp-buffer
+            (hermes-chat-prompt-indicator-respond))
+          (should (eq called-in chat))
+          (hermes-chat--clear-pending-prompts)
+          (with-temp-buffer
+            (should-error (hermes-chat-prompt-indicator-respond)
+                          :type 'user-error)))))))
+
 (provide 'hermes-chat-prompts-tests)
 ;;; hermes-chat-prompts-tests.el ends here

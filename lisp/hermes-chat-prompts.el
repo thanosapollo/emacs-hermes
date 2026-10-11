@@ -60,6 +60,41 @@ Invisible buffers and batch sessions record every prompt and show a message."
 (defvar hermes-chat--auto-prompting-p nil
   "Non-nil while an automatic minibuffer prompt is reading a response.")
 
+(defvar hermes-chat--prompt-indicator-buffers nil
+  "Chat buffers with pending prompt requests, oldest first.
+The global prompt indicator reads this registry rather than scanning every
+buffer on redisplay.  Prompt mutations keep it current.")
+
+(defvar hermes-chat-prompt-indicator-mode-line
+  '(:eval (hermes-chat--prompt-indicator-string))
+  "Mode-line construct showing pending Hermes chat prompts.")
+(put 'hermes-chat-prompt-indicator-mode-line 'risky-local-variable t)
+
+(defun hermes-chat--set-prompt-indicator (symbol value)
+  "Set SYMBOL to VALUE and add or remove the global prompt indicator.
+Install the segment when VALUE is non-nil, even before any prompt arrives,
+so chats that already wait for input show up at once."
+  (set-default symbol value)
+  (if value
+      (hermes-chat--prompt-indicator-install)
+    (hermes-chat--prompt-indicator-uninstall))
+  (force-mode-line-update t))
+
+(defcustom hermes-chat-prompt-indicator t
+  "Whether pending chat prompts are shown in the global mode line.
+When non-nil, `global-mode-string' shows a segment such as
+\"[Hermes: Clarify]\" while any chat awaits an approval, clarification or
+other input, so a prompt stays noticeable when its chat is not selected.
+The segment names only the prompt kind and count, never prompt contents.
+Clicking it answers from the owning chat.  Setting this option with
+Customize also adds or removes the segment.  The previous value of
+`global-mode-string' keeps its rendering, and removal takes out only the
+segment."
+  :type 'boolean
+  :initialize #'custom-initialize-default
+  :set #'hermes-chat--set-prompt-indicator
+  :group 'hermes)
+
 (defvar hermes-chat--reset-clarify-owner-sink nil
   "Dynamically bound holder for clarifications accepted during reset.")
 
@@ -172,6 +207,7 @@ response ownership.  Released snapshots have no revision or unlock operation."
         (when token
           (setq stored (plist-put stored :response-token token)))
         (puthash key stored table)
+        (hermes-chat--prompt-indicator-sync)
         stored)
     event))
 
@@ -203,6 +239,7 @@ response ownership.  Released snapshots have no revision or unlock operation."
     (remhash key hermes-chat--pending-prompts)
     (when (hash-table-p hermes-chat--auto-prompt-keys)
       (remhash key hermes-chat--auto-prompt-keys))
+    (hermes-chat--prompt-indicator-sync)
     (hermes-chat--notify-state-change)
     (unless (hermes-chat--show-pending-prompt-state)
       (hermes-chat--set-header-state
@@ -347,6 +384,7 @@ A nil SESSION-ID matches every prompt in the current buffer."
         (remhash key hermes-chat--pending-prompts)
         (hermes-chat--release-auto-prompt-claim key))
       (when keys
+        (hermes-chat--prompt-indicator-sync)
         (hermes-chat--notify-state-change)))))
 
 (defun hermes-chat--pending-prompt-p ()
@@ -431,6 +469,131 @@ A nil SESSION-ID matches every prompt in the current buffer."
   "Return the first pending prompt in deterministic key order."
   (and-let* ((key (car (hermes-chat--pending-prompt-keys))))
     (gethash key hermes-chat--pending-prompts)))
+
+;;;; Global pending-prompt indicator
+
+(defun hermes-chat--mode-line-segments-p (value)
+  "Return non-nil if mode-line construct VALUE is a list of segments.
+Such a list renders its elements in order, unlike a special construct
+headed by a symbol or an integer."
+  (and (proper-list-p value)
+       (or (stringp (car value)) (consp (car value)))))
+
+(defun hermes-chat--prompt-indicator-install ()
+  "Add the pending-prompt segment to the default `global-mode-string'.
+Append it to a list of segments, as other global segments do.  Wrap any
+other value, such as a string or a special construct, in a fresh symbol
+so it renders as before: a string held by a symbol is shown literally,
+but a string inside a list is %-processed."
+  (let ((value (default-value 'global-mode-string))
+        (segment 'hermes-chat-prompt-indicator-mode-line))
+    (cond
+     ((null value)
+      (set-default 'global-mode-string (list "" segment)))
+     ((not (hermes-chat--mode-line-segments-p value))
+      (let ((saved (make-symbol "hermes-saved-global-mode-string")))
+        (set saved value)
+        (put saved 'risky-local-variable t)
+        (put saved 'hermes-chat--prompt-indicator-wrapper t)
+        (set-default 'global-mode-string (list "" saved segment))))
+     ((not (memq segment value))
+      (set-default 'global-mode-string (append value (list segment)))))))
+
+(defun hermes-chat--prompt-indicator-uninstall ()
+  "Remove the pending-prompt segment from the default `global-mode-string'.
+Keep other elements.  If only the wrapper made on install remains, restore
+the value it holds; if nothing else remains, restore nil."
+  (let ((value (default-value 'global-mode-string))
+        (segment 'hermes-chat-prompt-indicator-mode-line))
+    (when (and (hermes-chat--mode-line-segments-p value)
+               (memq segment value))
+      (let ((rest (remq segment value)))
+        (set-default
+         'global-mode-string
+         (pcase rest
+           ('("") nil)
+           (`("" ,(and (pred symbolp) saved))
+            (if (get saved 'hermes-chat--prompt-indicator-wrapper)
+                (symbol-value saved)
+              rest))
+           (_ rest)))))))
+
+(defun hermes-chat--prompt-indicator-forget ()
+  "Remove the current buffer and dead buffers from the prompt indicator."
+  (let ((buffer (current-buffer)))
+    (when (memq buffer hermes-chat--prompt-indicator-buffers)
+      (setq hermes-chat--prompt-indicator-buffers
+            (seq-filter (lambda (other)
+                          (and (buffer-live-p other) (not (eq other buffer))))
+                        hermes-chat--prompt-indicator-buffers))
+      (force-mode-line-update t))))
+
+(defun hermes-chat--prompt-indicator-sync ()
+  "Register or retire the current chat in the global prompt indicator.
+Membership does not depend on `hermes-chat-prompt-indicator', so enabling
+the option later shows prompts that arrived while it was off.  Killing the
+chat or changing its major mode retires it."
+  (let ((pending (hermes-chat--pending-prompt-p))
+        (known (memq (current-buffer) hermes-chat--prompt-indicator-buffers)))
+    (cond
+     ((and pending (not known))
+      (setq hermes-chat--prompt-indicator-buffers
+            (append hermes-chat--prompt-indicator-buffers
+                    (list (current-buffer))))
+      (add-hook 'kill-buffer-hook #'hermes-chat--prompt-indicator-forget nil t)
+      (add-hook 'change-major-mode-hook
+                #'hermes-chat--prompt-indicator-forget nil t)
+      (when hermes-chat-prompt-indicator
+        (hermes-chat--prompt-indicator-install))
+      (force-mode-line-update t))
+     ((and known (not pending))
+      (hermes-chat--prompt-indicator-forget))
+     (known (force-mode-line-update t)))))
+
+(defun hermes-chat--prompt-indicator-pending ()
+  "Return live registered chat buffers with pending prompt requests."
+  (seq-filter (lambda (buffer)
+                (and (buffer-live-p buffer)
+                     (with-current-buffer buffer
+                       (hermes-chat--pending-prompt-p))))
+              hermes-chat--prompt-indicator-buffers))
+
+(defvar-keymap hermes-chat--prompt-indicator-map
+  :doc "Mouse access to pending Hermes prompts from the global mode line."
+  "<mode-line> <mouse-1>" #'hermes-chat-prompt-indicator-respond)
+
+(defun hermes-chat--prompt-indicator-string ()
+  "Return the global pending-prompt indicator, or nil if none is pending.
+Name only the oldest chat's first prompt kind and the total count: prompt
+contents may be sensitive and never belong in the mode line."
+  (when-let* ((hermes-chat-prompt-indicator)
+              (buffers (hermes-chat--prompt-indicator-pending)))
+    (let* ((owner (car buffers))
+           (kind (with-current-buffer owner
+                   (hermes-chat--prompt-display-name
+                    (hermes-chat--first-pending-prompt))))
+           (count (apply #'+ (mapcar (lambda (buffer)
+                                       (with-current-buffer buffer
+                                         (hermes-chat--pending-prompt-count)))
+                                     buffers))))
+      (propertize
+       (format " [Hermes: %s%s]" kind
+               (if (> count 1) (format " +%d" (1- count)) ""))
+       'face 'warning
+       'mouse-face 'mode-line-highlight
+       'local-map hermes-chat--prompt-indicator-map
+       'help-echo (format "%d pending Hermes prompt%s\nmouse-1: answer in %s"
+                          count (if (= count 1) "" "s") (buffer-name owner))))))
+
+(defun hermes-chat-prompt-indicator-respond ()
+  "Respond to a pending prompt in the oldest waiting Hermes chat.
+This is the mouse action of the global pending-prompt indicator."
+  (interactive)
+  (let ((buffer (car (hermes-chat--prompt-indicator-pending))))
+    (unless buffer
+      (user-error "No pending Hermes prompt requests"))
+    (pop-to-buffer buffer)
+    (call-interactively #'hermes-chat-respond-to-prompt)))
 
 (defun hermes-chat--prompt-header-status (prompt)
   "Return header status symbol for pending PROMPT."
@@ -593,6 +756,7 @@ A nil SESSION-ID matches every prompt in the current buffer."
              entry (hermes-chat--terminal-auto-prompt key))
         (remhash key hermes-chat--auto-prompt-keys))
       (remhash key hermes-chat--pending-prompts)
+      (hermes-chat--prompt-indicator-sync)
       (plist-get entry :response-token))))
 
 (defun hermes-chat--take-terminal-approval (entry)
@@ -622,7 +786,8 @@ A nil SESSION-ID matches every prompt in the current buffer."
       (if remaining
           (puthash key (hermes-chat--approval-prompt-with-queue remaining)
                    hermes-chat--pending-prompts)
-        (remhash key hermes-chat--pending-prompts)))))
+        (remhash key hermes-chat--pending-prompts))
+      (hermes-chat--prompt-indicator-sync))))
 
 (defun hermes-chat--terminal-restore-effect (owner)
   "Return a dormant one-shot restoration thunk for OWNER."
@@ -979,6 +1144,7 @@ Return the next pending prompt."
                (plist-get prompt :assistant-id))
            next))
       (remhash key hermes-chat--pending-prompts))
+    (hermes-chat--prompt-indicator-sync)
     next))
 
 (defun hermes-chat--prompt-response-complete (context prompt canceled result)

@@ -790,10 +790,9 @@
           (focused t)
           arguments
           opened)
+      (set-window-buffer (selected-window) (current-buffer))
       (cl-letf (((symbol-function 'frame-focus-state)
                  (lambda (&rest _) focused))
-                ((symbol-function 'get-buffer-window)
-                 (lambda (&rest _) (and focused (selected-window))))
                 ((symbol-function 'require) (lambda (&rest _) t))
                 ((symbol-function 'notifications-notify)
                  (lambda (&rest args) (setq arguments args) 17))
